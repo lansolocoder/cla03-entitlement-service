@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lansolocoder/cla03-entitlement-service/internal/httpapi"
+	"github.com/lansolocoder/cla03-entitlement-service/internal/store"
 )
 
 func main() {
@@ -26,12 +27,24 @@ func main() {
 		log.Fatal("invalid database configuration")
 	}
 	defer pool.Close()
+
+	st := store.New(pool)
+	if err := st.EnsureSchema(ctx); err != nil {
+		log.Fatalf("failed to initialize database schema: %v", err)
+	}
+
+	// Expire stale pending reservations periodically so held quota is
+	// released even without traffic touching the pool.
+	housekeepingCtx, cancelHousekeeping := context.WithCancel(ctx)
+	defer cancelHousekeeping()
+	go runHousekeeping(housekeepingCtx, st, time.Minute)
+
 	address := os.Getenv("LISTEN_ADDR")
 	if address == "" {
 		address = "127.0.0.1:8080"
 	}
 	server := &http.Server{
-		Addr: address, Handler: httpapi.New(pool.Ping),
+		Addr: address, Handler: httpapi.New(pool.Ping, st),
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second,
 	}
@@ -47,6 +60,24 @@ func main() {
 		defer cancel()
 		if err := server.Shutdown(shutdown); err != nil {
 			_ = server.Close()
+		}
+	}
+}
+
+// runHousekeeping expires pending reservations past their deadline on a tick.
+func runHousekeeping(ctx context.Context, st *store.Store, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			opCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			if err := st.ExpirePending(opCtx); err != nil {
+				log.Printf("reservation housekeeping failed: %v", err)
+			}
+			cancel()
 		}
 	}
 }
