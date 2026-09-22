@@ -43,7 +43,7 @@ func newEnv(t *testing.T) *env {
 	}
 	// Recreate the schema so test runs track the current table definitions.
 	e := &env{t: t, pool: pool, handler: New(NewStore(pool))}
-	e.exec(`DROP TABLE IF EXISTS idempotency_records, reservations, quota_pools CASCADE`)
+	e.exec(`DROP TABLE IF EXISTS idempotency_records, reservations, team_allocations, quota_pools CASCADE`)
 	if err := EnsureSchema(ctx, pool); err != nil {
 		pool.Close()
 		t.Fatalf("ensure schema: %v", err)
@@ -101,6 +101,25 @@ func (e *env) createReservation(tenant, pool, reservation, key string, amount in
 	body := fmt.Sprintf(`{"reservationId":%q,"amount":%d,"expiresAt":%q}`,
 		reservation, amount, expiresAt.Format(time.RFC3339Nano))
 	return e.createReservationRaw(tenant, pool, key, body)
+}
+
+func (e *env) createTeamReservation(tenant, pool, reservation, team, key string, amount int, expiresAt time.Time) *httptest.ResponseRecorder {
+	body := fmt.Sprintf(`{"reservationId":%q,"amount":%d,"expiresAt":%q,"teamId":%q}`,
+		reservation, amount, expiresAt.Format(time.RFC3339Nano), team)
+	return e.createReservationRaw(tenant, pool, key, body)
+}
+
+func (e *env) setAllocationRaw(tenant, pool, team, key, body string) *httptest.ResponseRecorder {
+	return e.do(http.MethodPost, "/v1/tenants/"+tenant+"/quota-pools/"+pool+"/teams/"+team+"/allocation", key, body)
+}
+
+func (e *env) setAllocation(tenant, pool, team, key string, amount, expectedVersion int) *httptest.ResponseRecorder {
+	body := fmt.Sprintf(`{"amount":%d,"expectedVersion":%d}`, amount, expectedVersion)
+	return e.setAllocationRaw(tenant, pool, team, key, body)
+}
+
+func (e *env) getAllocation(tenant, pool, team string) *httptest.ResponseRecorder {
+	return e.do(http.MethodGet, "/v1/tenants/"+tenant+"/quota-pools/"+pool+"/teams/"+team+"/allocation", "", "")
 }
 
 func TestIntegrationPoolLifecycle(t *testing.T) {
@@ -525,11 +544,199 @@ func TestIntegrationStorageFailureIsGeneric503(t *testing.T) {
 	}
 }
 
+func TestIntegrationTeamAllocationLowerBound(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("tl", "pl", 100, now.Add(-time.Hour), now.Add(2*time.Hour))
+	e.setAllocation("tl", "pl", "team-1", "k-a", 50, 0)
+	e.createTeamReservation("tl", "pl", "r1", "team-1", "k-r1", 30, now.Add(time.Hour))
+	e.createTeamReservation("tl", "pl", "r2", "team-1", "k-r2", 10, now.Add(time.Hour))
+	e.do(http.MethodPost, "/v1/tenants/tl/quota-pools/pl/reservations/r2/confirm", "k-c2", "")
+
+	// Occupied: 30 pending + 10 confirmed = 40. Lowering below that conflicts.
+	if rec := e.setAllocation("tl", "pl", "team-1", "k-low", 39, 1); rec.Code != http.StatusConflict {
+		t.Fatalf("lower below occupied status=%d", rec.Code)
+	}
+	if rec := e.getAllocation("tl", "pl", "team-1"); !strings.Contains(rec.Body.String(), `"allocated":50`) {
+		t.Fatalf("rejected lowering must not apply: %s", rec.Body.String())
+	}
+	// Lowering to exactly the occupied amount is allowed.
+	rec := e.setAllocation("tl", "pl", "team-1", "k-eq", 40, 1)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"used":40`) ||
+		!strings.Contains(rec.Body.String(), `"available":0`) {
+		t.Fatalf("lower to occupied: %d %s", rec.Code, rec.Body.String())
+	}
+	// Releasing the pending reservation frees team quota for a deeper cut.
+	e.do(http.MethodPost, "/v1/tenants/tl/quota-pools/pl/reservations/r1/release", "k-rel", "")
+	rec = e.setAllocation("tl", "pl", "team-1", "k-deep", 10, 2)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"used":10`) {
+		t.Fatalf("lower after release: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestIntegrationTeamReservationFlow(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("tt", "pt", 100, now.Add(-time.Hour), now.Add(2*time.Hour))
+	e.setAllocation("tt", "pt", "team-1", "k-a", 40, 0)
+
+	// Unknown team cannot reserve.
+	if rec := e.createTeamReservation("tt", "pt", "rx", "ghost", "k-x", 1, now.Add(time.Hour)); rec.Code != http.StatusConflict {
+		t.Fatalf("unknown team status=%d", rec.Code)
+	}
+
+	created := e.createTeamReservation("tt", "pt", "r1", "team-1", "k-r1", 30, now.Add(time.Hour))
+	if created.Code != http.StatusCreated || !strings.Contains(created.Body.String(), `"teamId":"team-1"`) {
+		t.Fatalf("team reservation status=%d body=%s", created.Code, created.Body.String())
+	}
+	get := e.do(http.MethodGet, "/v1/tenants/tt/quota-pools/pt/reservations/r1", "", "")
+	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"teamId":"team-1"`) {
+		t.Fatalf("get must include teamId: %d %s", get.Code, get.Body.String())
+	}
+	// Team balance is exhausted even though the pool still has room.
+	if rec := e.createTeamReservation("tt", "pt", "r2", "team-1", "k-r2", 11, now.Add(time.Hour)); rec.Code != http.StatusConflict {
+		t.Fatalf("over team balance status=%d", rec.Code)
+	}
+	// Teamless reservations are unaffected by the team's balance.
+	if rec := e.createReservation("tt", "pt", "r3", "k-r3", 60, now.Add(time.Hour)); rec.Code != http.StatusCreated {
+		t.Fatalf("teamless reservation status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := e.do(http.MethodGet, "/v1/tenants/tt/quota-pools/pt/reservations/r3", "", ""); strings.Contains(rec.Body.String(), "teamId") {
+		t.Fatalf("teamless reservation must not carry teamId: %s", rec.Body.String())
+	}
+	// The pool level still caps the total: 30 + 60 used of 100.
+	if rec := e.createReservation("tt", "pt", "r4", "k-r4", 11, now.Add(time.Hour)); rec.Code != http.StatusConflict {
+		t.Fatalf("over pool limit status=%d", rec.Code)
+	}
+
+	// Releasing the team reservation restores the team's balance.
+	e.do(http.MethodPost, "/v1/tenants/tt/quota-pools/pt/reservations/r1/release", "k-rel", "")
+	if rec := e.getAllocation("tt", "pt", "team-1"); !strings.Contains(rec.Body.String(), `"used":0`) {
+		t.Fatalf("release must free team quota: %s", rec.Body.String())
+	}
+	if rec := e.createTeamReservation("tt", "pt", "r5", "team-1", "k-r5", 40, now.Add(time.Hour)); rec.Code != http.StatusCreated {
+		t.Fatalf("rebook after release status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Confirming keeps the quota occupied at both levels.
+	e.do(http.MethodPost, "/v1/tenants/tt/quota-pools/pt/reservations/r5/confirm", "k-c5", "")
+	if rec := e.getAllocation("tt", "pt", "team-1"); !strings.Contains(rec.Body.String(), `"used":40`) {
+		t.Fatalf("confirmed quota must stay occupied: %s", rec.Body.String())
+	}
+	if rec := e.createReservation("tt", "pt", "r6", "k-r6", 31, now.Add(time.Hour)); rec.Code != http.StatusConflict {
+		t.Fatalf("confirmed quota must stay consumed at pool level, status=%d", rec.Code)
+	}
+}
+
+func TestIntegrationTeamReservationExpiryRestoresBalance(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("tx", "px", 100, now.Add(-time.Hour), now.Add(2*time.Hour))
+	e.setAllocation("tx", "px", "team-1", "k-a", 10, 0)
+
+	deadline := time.Now().Add(1100 * time.Millisecond)
+	if rec := e.createTeamReservation("tx", "px", "r1", "team-1", "k-r1", 10, deadline); rec.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := e.createTeamReservation("tx", "px", "r2", "team-1", "k-r2", 1, now.Add(time.Hour)); rec.Code != http.StatusConflict {
+		t.Fatalf("expected team exhaustion, status=%d", rec.Code)
+	}
+
+	time.Sleep(1300 * time.Millisecond)
+
+	// Expired pending quota is bookable again at the team level.
+	if rec := e.createTeamReservation("tx", "px", "r3", "team-1", "k-r3", 10, now.Add(time.Hour)); rec.Code != http.StatusCreated {
+		t.Fatalf("rebook after expiry status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := e.getAllocation("tx", "px", "team-1"); !strings.Contains(rec.Body.String(), `"used":10`) {
+		t.Fatalf("summary must reflect only live reservations: %s", rec.Body.String())
+	}
+}
+
+func TestIntegrationConcurrentTeamReservationsNeverOversubscribe(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("ty", "py", 100, now.Add(-time.Hour), now.Add(2*time.Hour))
+	e.setAllocation("ty", "py", "team-1", "k-a", 50, 0)
+
+	var wg sync.WaitGroup
+	statuses := make(chan int, 20)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec := e.createTeamReservation("ty", "py", fmt.Sprintf("r%02d", i), "team-1",
+				fmt.Sprintf("key-%02d", i), 10, now.Add(time.Hour))
+			statuses <- rec.Code
+		}(i)
+	}
+	wg.Wait()
+	close(statuses)
+
+	created := 0
+	for s := range statuses {
+		if s == http.StatusCreated {
+			created++
+		} else if s != http.StatusConflict {
+			t.Fatalf("unexpected status %d", s)
+		}
+	}
+	if created != 5 {
+		t.Fatalf("team allocation 50 must admit exactly 5x10, got %d", created)
+	}
+	used := e.queryInt(`
+		SELECT COALESCE(SUM(amount),0) FROM reservations
+		WHERE tenant_id='ty' AND pool_id='py' AND team_id='team-1' AND status IN ('pending','confirmed')`)
+	if used != 50 {
+		t.Fatalf("team used=%d, team allocation must never be exceeded", used)
+	}
+}
+
+func TestIntegrationConcurrentAllocationAndReservation(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("tz", "pz", 100, now.Add(-time.Hour), now.Add(2*time.Hour))
+	e.setAllocation("tz", "pz", "team-1", "k-a", 50, 0)
+	e.createTeamReservation("tz", "pz", "r1", "team-1", "k-r1", 40, now.Add(time.Hour))
+
+	// Lowering to exactly the occupied amount races with a reservation of the
+	// remaining 10: whichever commits first, the team can never exceed 50.
+	var wg sync.WaitGroup
+	results := make(chan int, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		results <- e.setAllocation("tz", "pz", "team-1", "k-lower", 40, 1).Code
+	}()
+	go func() {
+		defer wg.Done()
+		results <- e.createTeamReservation("tz", "pz", "r2", "team-1", "k-r2", 10, now.Add(time.Hour)).Code
+	}()
+	wg.Wait()
+	close(results)
+	for s := range results {
+		if s != http.StatusOK && s != http.StatusCreated && s != http.StatusConflict {
+			t.Fatalf("unexpected status %d", s)
+		}
+	}
+	var allocated, used int
+	e.pool.QueryRow(context.Background(),
+		`SELECT allocated FROM team_allocations WHERE tenant_id='tz' AND pool_id='pz' AND team_id='team-1'`).Scan(&allocated)
+	e.pool.QueryRow(context.Background(), `
+		SELECT COALESCE(SUM(amount),0) FROM reservations
+		WHERE tenant_id='tz' AND pool_id='pz' AND team_id='team-1' AND status IN ('pending','confirmed')`).Scan(&used)
+	if used > allocated {
+		t.Fatalf("team used %d exceeds allocation %d", used, allocated)
+	}
+}
+
 func TestIntegrationDataSurvivesPoolRestart(t *testing.T) {
 	e := newEnv(t)
 	now := time.Now().UTC()
 	e.createPool("ts", "ps", 10, now.Add(-time.Hour), now.Add(2*time.Hour))
 	e.createReservation("ts", "ps", "r1", "k1", 3, now.Add(time.Hour))
+	e.setAllocation("ts", "ps", "team-1", "ka1", 5, 0)
+	e.createTeamReservation("ts", "ps", "r2", "team-1", "k2", 2, now.Add(time.Hour))
 
 	// Reopen the connection pool as a freshly started process would.
 	url := testDatabaseURL()
@@ -551,5 +758,166 @@ func TestIntegrationDataSurvivesPoolRestart(t *testing.T) {
 	rec = e.createReservationRaw("ts", "ps", "k1", body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("idempotency replay after restart status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// Team allocations and team-scoped reservations survive as well.
+	rec = e.getAllocation("ts", "ps", "team-1")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"allocated":5`) ||
+		!strings.Contains(rec.Body.String(), `"used":2`) {
+		t.Fatalf("allocation did not survive restart: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = e.do(http.MethodGet, "/v1/tenants/ts/quota-pools/ps/reservations/r2", "", "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"teamId":"team-1"`) {
+		t.Fatalf("team reservation did not survive restart: %d %s", rec.Code, rec.Body.String())
+	}
+	// A stored allocation idempotency record still replays after restart.
+	rec = e.setAllocation("ts", "ps", "team-1", "ka1", 5, 0)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"version":1`) {
+		t.Fatalf("allocation replay after restart status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestIntegrationTeamAllocationLifecycle(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("ta", "pa", 100, now.Add(-time.Hour), now.Add(2*time.Hour))
+	target := "/v1/tenants/ta/quota-pools/pa/teams/team-1/allocation"
+
+	// Missing team, missing pool, and cross-tenant reads are all 404.
+	if rec := e.getAllocation("ta", "pa", "team-1"); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing team status=%d", rec.Code)
+	}
+	if rec := e.getAllocation("ta", "ghost", "team-1"); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing pool status=%d", rec.Code)
+	}
+
+	// First write must expect the initial version 0.
+	if rec := e.setAllocation("ta", "pa", "team-2", "kbad", 10, 1); rec.Code != http.StatusConflict {
+		t.Fatalf("wrong initial version status=%d", rec.Code)
+	}
+	rec := e.do(http.MethodPost, target, "k1", `{"amount":60,"expectedVersion":0}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first allocation status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var alloc allocationResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &alloc); err != nil {
+		t.Fatal(err)
+	}
+	if alloc.TeamID != "team-1" || alloc.Allocated != 60 || alloc.Used != 0 || alloc.Available != 60 || alloc.Version != 1 {
+		t.Fatalf("unexpected allocation %+v", alloc)
+	}
+
+	// The allocation is invisible to other tenants.
+	if rec := e.getAllocation("other", "pa", "team-1"); rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-tenant status=%d", rec.Code)
+	}
+
+	// GET returns the same summary.
+	rec = e.getAllocation("ta", "pa", "team-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get status=%d", rec.Code)
+	}
+	var got allocationResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != alloc {
+		t.Fatalf("get %+v != post %+v", got, alloc)
+	}
+
+	// Version mismatch leaves the state unchanged.
+	if rec := e.setAllocation("ta", "pa", "team-1", "k2", 10, 0); rec.Code != http.StatusConflict {
+		t.Fatalf("stale version status=%d", rec.Code)
+	}
+	if rec := e.getAllocation("ta", "pa", "team-1"); !strings.Contains(rec.Body.String(), `"allocated":60`) {
+		t.Fatalf("stale write must not apply: %s", rec.Body.String())
+	}
+
+	// Allocations across teams may not exceed the pool limit.
+	if rec := e.setAllocation("ta", "pa", "team-2", "k3", 41, 0); rec.Code != http.StatusConflict {
+		t.Fatalf("over-limit status=%d", rec.Code)
+	}
+	if rec := e.setAllocation("ta", "pa", "team-2", "k4", 40, 0); rec.Code != http.StatusOK {
+		t.Fatalf("at-limit status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// Raising team-1 so the total exceeds the limit conflicts too.
+	if rec := e.setAllocation("ta", "pa", "team-1", "k5", 61, 1); rec.Code != http.StatusConflict {
+		t.Fatalf("raise over limit status=%d", rec.Code)
+	}
+
+	// Occupied quota bounds how far an allocation can be lowered.
+	e.createTeamReservation("ta", "pa", "r1", "team-1", "kr1", 20, now.Add(time.Hour))
+	if rec := e.setAllocation("ta", "pa", "team-1", "k6", 19, 1); rec.Code != http.StatusConflict {
+		t.Fatalf("lower below occupied status=%d", rec.Code)
+	}
+	rec = e.setAllocation("ta", "pa", "team-1", "k7", 20, 1)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"used":20`) ||
+		!strings.Contains(rec.Body.String(), `"available":0`) || !strings.Contains(rec.Body.String(), `"version":2`) {
+		t.Fatalf("lower to occupied: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Allocating into a missing pool is a conflict, not a write.
+	if rec := e.setAllocation("ta", "ghost", "team-1", "k8", 1, 0); rec.Code != http.StatusConflict {
+		t.Fatalf("missing pool status=%d", rec.Code)
+	}
+	if n := e.queryInt(`SELECT count(*) FROM team_allocations WHERE pool_id='ghost'`); n != 0 {
+		t.Fatal("allocation into a missing pool must not persist")
+	}
+}
+
+func TestIntegrationAllocationIdempotency(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("ti", "pi", 100, now.Add(-time.Hour), now.Add(2*time.Hour))
+
+	body := `{"amount":30,"expectedVersion":0}`
+	first := e.setAllocationRaw("ti", "pi", "team-1", "idem-1", body)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
+	}
+	// Identical replay: 200 with the original result, version not bumped again.
+	replay := e.setAllocationRaw("ti", "pi", "team-1", "idem-1", body)
+	if replay.Code != http.StatusOK || replay.Body.String() != first.Body.String() {
+		t.Fatalf("replay status=%d body=%s original=%s", replay.Code, replay.Body.String(), first.Body.String())
+	}
+	if rec := e.getAllocation("ti", "pi", "team-1"); !strings.Contains(rec.Body.String(), `"version":1`) {
+		t.Fatalf("replay must not bump the version: %s", rec.Body.String())
+	}
+	// Same key, different content: 409.
+	if rec := e.setAllocationRaw("ti", "pi", "team-1", "idem-1", `{"amount":31,"expectedVersion":0}`); rec.Code != http.StatusConflict {
+		t.Fatalf("mismatch status=%d", rec.Code)
+	}
+	// The key is tenant-scoped: the same key against a different path is a
+	// different request and conflicts, even with an identical body.
+	if rec := e.setAllocationRaw("ti", "pi", "team-2", "idem-1", body); rec.Code != http.StatusConflict {
+		t.Fatalf("cross-team key reuse status=%d", rec.Code)
+	}
+	// A stored business conflict replays as 200 with the original body.
+	conflict := e.setAllocationRaw("ti", "pi", "team-1", "idem-2", `{"amount":10,"expectedVersion":5}`)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("conflict status=%d", conflict.Code)
+	}
+	replay = e.setAllocationRaw("ti", "pi", "team-1", "idem-2", `{"amount":10,"expectedVersion":5}`)
+	if replay.Code != http.StatusOK || replay.Body.String() != conflict.Body.String() {
+		t.Fatalf("conflict replay status=%d body=%s", replay.Code, replay.Body.String())
+	}
+	// Concurrent identical requests apply the allocation exactly once.
+	var wg sync.WaitGroup
+	statuses := make(chan int, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			statuses <- e.setAllocationRaw("ti", "pi", "team-3", "idem-3", `{"amount":5,"expectedVersion":0}`).Code
+		}()
+	}
+	wg.Wait()
+	close(statuses)
+	for s := range statuses {
+		if s != http.StatusOK {
+			t.Fatalf("concurrent status=%d", s)
+		}
+	}
+	if rec := e.getAllocation("ti", "pi", "team-3"); !strings.Contains(rec.Body.String(), `"version":1`) {
+		t.Fatalf("concurrent same-key writes must apply once: %s", rec.Body.String())
 	}
 }

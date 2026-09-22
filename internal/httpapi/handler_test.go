@@ -13,25 +13,34 @@ import (
 type mockBackend struct {
 	pingErr error
 
-	poolIn        poolInput
-	poolCreated   bool
-	poolErr       error
-	poolCalls     int
-	reservationIn reservationInput
-	resResult     operationResult
-	resErr        error
-	resCalls      int
-	resKey        string
-	resHash       string
-	resTenant     string
-	resPool       string
-	decision      string
-	decResult     operationResult
-	decErr        error
-	decCalls      int
-	getResult     reservationResponse
-	getErr        error
-	getCalls      int
+	poolIn         poolInput
+	poolCreated    bool
+	poolErr        error
+	poolCalls      int
+	reservationIn  reservationInput
+	resResult      operationResult
+	resErr         error
+	resCalls       int
+	resKey         string
+	resHash        string
+	resTenant      string
+	resPool        string
+	decision       string
+	decResult      operationResult
+	decErr         error
+	decCalls       int
+	getResult      reservationResponse
+	getErr         error
+	getCalls       int
+	resTeam        string
+	allocResult    operationResult
+	allocErr       error
+	allocCalls     int
+	allocAmount    int64
+	allocExpected  int64
+	getAllocResult allocationResponse
+	getAllocErr    error
+	getAllocCalls  int
 }
 
 func (m *mockBackend) Ping(context.Context) error { return m.pingErr }
@@ -65,6 +74,19 @@ func (m *mockBackend) getReservation(_ context.Context, tenantID, poolID, reserv
 	m.getCalls++
 	m.resTenant, m.resPool = tenantID, poolID
 	return m.getResult, m.getErr
+}
+
+func (m *mockBackend) setAllocation(_ context.Context, tenantID, poolID, teamID, key, hash string, amount, expectedVersion int64) (operationResult, error) {
+	m.allocCalls++
+	m.resTenant, m.resPool, m.resTeam, m.resKey, m.resHash = tenantID, poolID, teamID, key, hash
+	m.allocAmount, m.allocExpected = amount, expectedVersion
+	return m.allocResult, m.allocErr
+}
+
+func (m *mockBackend) getAllocation(_ context.Context, tenantID, poolID, teamID string) (allocationResponse, error) {
+	m.getAllocCalls++
+	m.resTenant, m.resPool, m.resTeam = tenantID, poolID, teamID
+	return m.getAllocResult, m.getAllocErr
 }
 
 func request(method, target string, body string) *http.Request {
@@ -331,6 +353,149 @@ func TestGetReservation(t *testing.T) {
 		rec := httptest.NewRecorder()
 		New(mb).ServeHTTP(rec, request(http.MethodGet, target, ""))
 		if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), "reset") {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+func TestPostReservationTeamID(t *testing.T) {
+	target := "/v1/tenants/t1/quota-pools/p1/reservations"
+
+	t.Run("teamId passed through", func(t *testing.T) {
+		mb := &mockBackend{resResult: operationResult{status: http.StatusCreated, body: []byte(`{"teamId":"team-1"}`)}}
+		rec := httptest.NewRecorder()
+		body := `{"reservationId":"r1","amount":5,"expiresAt":"2026-12-31T00:00:00Z","teamId":"team-1"}`
+		New(mb).ServeHTTP(rec, withKey(request(http.MethodPost, target, body), "k1"))
+		if rec.Code != http.StatusCreated || mb.reservationIn.teamID != "team-1" {
+			t.Fatalf("status=%d input=%+v", rec.Code, mb.reservationIn)
+		}
+	})
+
+	t.Run("blank teamId rejected", func(t *testing.T) {
+		mb := &mockBackend{}
+		rec := httptest.NewRecorder()
+		body := `{"reservationId":"r1","amount":5,"expiresAt":"2026-12-31T00:00:00Z","teamId":"  "}`
+		New(mb).ServeHTTP(rec, withKey(request(http.MethodPost, target, body), "k1"))
+		if rec.Code != http.StatusBadRequest || mb.resCalls != 0 {
+			t.Fatalf("status=%d calls=%d", rec.Code, mb.resCalls)
+		}
+	})
+
+	t.Run("teamId changes the request hash", func(t *testing.T) {
+		mb := &mockBackend{resResult: operationResult{status: http.StatusCreated, body: []byte(`{}`)}}
+		h := New(mb)
+		base := `{"reservationId":"r1","amount":5,"expiresAt":"2026-12-31T00:00:00Z"`
+		r1 := httptest.NewRecorder()
+		h.ServeHTTP(r1, withKey(request(http.MethodPost, target, base+`}`), "k"))
+		teamless := mb.resHash
+		r2 := httptest.NewRecorder()
+		h.ServeHTTP(r2, withKey(request(http.MethodPost, target, base+`,"teamId":"team-1"}`), "k"))
+		if teamless == mb.resHash {
+			t.Fatal("requests with and without teamId must hash differently")
+		}
+	})
+}
+
+func TestPostAllocation(t *testing.T) {
+	target := "/v1/tenants/t1/quota-pools/p1/teams/team-1/allocation"
+	validBody := `{"amount":50,"expectedVersion":0}`
+
+	t.Run("missing idempotency key", func(t *testing.T) {
+		mb := &mockBackend{}
+		rec := httptest.NewRecorder()
+		New(mb).ServeHTTP(rec, request(http.MethodPost, target, validBody))
+		if rec.Code != http.StatusBadRequest || mb.allocCalls != 0 {
+			t.Fatalf("status=%d calls=%d", rec.Code, mb.allocCalls)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"missing amount", `{"expectedVersion":0}`},
+		{"negative amount", `{"amount":-1,"expectedVersion":0}`},
+		{"fractional amount", `{"amount":1.5,"expectedVersion":0}`},
+		{"missing expectedVersion", `{"amount":50}`},
+		{"negative expectedVersion", `{"amount":50,"expectedVersion":-1}`},
+		{"fractional expectedVersion", `{"amount":50,"expectedVersion":0.5}`},
+		{"unknown field", `{"amount":50,"expectedVersion":0,"x":1}`},
+		{"malformed json", `{not json`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mb := &mockBackend{}
+			rec := httptest.NewRecorder()
+			New(mb).ServeHTTP(rec, withKey(request(http.MethodPost, target, tc.body), "k1"))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if mb.allocCalls != 0 {
+				t.Fatal("invalid request must not reach storage")
+			}
+		})
+	}
+
+	t.Run("success passes parsed input and key", func(t *testing.T) {
+		mb := &mockBackend{allocResult: operationResult{status: http.StatusOK, body: []byte(`{"allocated":50}`)}}
+		rec := httptest.NewRecorder()
+		New(mb).ServeHTTP(rec, withKey(request(http.MethodPost, target, validBody), "key-1"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d", rec.Code)
+		}
+		if mb.resKey != "key-1" || mb.resTeam != "team-1" || mb.allocAmount != 50 || mb.allocExpected != 0 {
+			t.Fatalf("backend got %+v", mb)
+		}
+		if mb.resHash == "" {
+			t.Fatal("request hash must be supplied")
+		}
+	})
+
+	t.Run("zero amount is valid", func(t *testing.T) {
+		mb := &mockBackend{allocResult: operationResult{status: http.StatusOK, body: []byte(`{"allocated":0}`)}}
+		rec := httptest.NewRecorder()
+		New(mb).ServeHTTP(rec, withKey(request(http.MethodPost, target, `{"amount":0,"expectedVersion":0}`), "k"))
+		if rec.Code != http.StatusOK || mb.allocAmount != 0 {
+			t.Fatalf("status=%d amount=%d", rec.Code, mb.allocAmount)
+		}
+	})
+
+	t.Run("storage error hidden", func(t *testing.T) {
+		mb := &mockBackend{allocErr: errors.New("secret constraint detail")}
+		rec := httptest.NewRecorder()
+		New(mb).ServeHTTP(rec, withKey(request(http.MethodPost, target, validBody), "k"))
+		if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), "secret") {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+func TestGetAllocation(t *testing.T) {
+	target := "/v1/tenants/t1/quota-pools/p1/teams/team-1/allocation"
+
+	t.Run("found", func(t *testing.T) {
+		mb := &mockBackend{getAllocResult: allocationResponse{TeamID: "team-1", Allocated: 50, Used: 10, Available: 40, Version: 3}}
+		rec := httptest.NewRecorder()
+		New(mb).ServeHTTP(rec, request(http.MethodGet, target, ""))
+		body := rec.Body.String()
+		if rec.Code != http.StatusOK || !strings.Contains(body, `"allocated":50`) || !strings.Contains(body, `"version":3`) {
+			t.Fatalf("status=%d body=%s", rec.Code, body)
+		}
+	})
+
+	t.Run("missing and cross-tenant both 404", func(t *testing.T) {
+		mb := &mockBackend{getAllocErr: errNotFound}
+		rec := httptest.NewRecorder()
+		New(mb).ServeHTTP(rec, request(http.MethodGet, target, ""))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status=%d", rec.Code)
+		}
+	})
+
+	t.Run("storage error 503", func(t *testing.T) {
+		mb := &mockBackend{getAllocErr: errors.New("private socket detail")}
+		rec := httptest.NewRecorder()
+		New(mb).ServeHTTP(rec, request(http.MethodGet, target, ""))
+		if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), "private") {
 			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 		}
 	})

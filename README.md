@@ -51,6 +51,46 @@ reservation is created atomically and `201` returned. Any failed condition
 returns `409`. Past-deadline `pending` reservations lazily become `expired`
 and release their quota on the next reservation, decision, or fetch.
 
+An optional `teamId` scopes the reservation to a team:
+
+```json
+{"reservationId": "r-2", "amount": 5, "expiresAt": "2026-06-01T00:00:00Z", "teamId": "team-1"}
+```
+
+The team must already have an allocation in the pool, and both the pool-level
+and the team-level balance must be sufficient; otherwise `409`. The response
+and later fetches of the record include `teamId`. Reservations without
+`teamId` (including all historical records) behave exactly as before and do
+not consume team quota. Releasing or expiring a team reservation restores the
+team's balance; a `confirmed` reservation keeps occupying it.
+
+### Team allocations
+
+`POST /v1/tenants/{tenantId}/quota-pools/{poolId}/teams/{teamId}/allocation`
+(requires `Idempotency-Key`)
+
+```json
+{"amount": 50, "expectedVersion": 0}
+```
+
+Sets the team's allocated quota within the pool. `amount` and
+`expectedVersion` must be non-negative integers. A team that has never been
+allocated starts at allocated `0`, version `0`. The update applies only when
+`expectedVersion` matches the current version: the allocation is set to
+`amount` and the version is incremented, returning `200` with
+`{"teamId", "allocated", "used", "available", "version"}`. `used` is the
+team's unexpired `pending` plus `confirmed` reservation total;
+`available = allocated - used`.
+
+The total of all team allocations in a pool may not exceed the pool `limit`,
+and a lowered allocation may not drop below the team's currently occupied
+quota — both return `409` and leave the state unchanged, as does a version
+mismatch or an unknown pool.
+
+`GET /v1/tenants/{tenantId}/quota-pools/{poolId}/teams/{teamId}/allocation`
+returns the same summary with `200`. A missing team or pool, or one owned by
+another tenant, returns `404`.
+
 ### Confirm or release a reservation
 
 `POST .../reservations/{reservationId}/confirm` and
@@ -75,7 +115,10 @@ request returns `200` and the original result (including an originally `409`
 business outcome, which replays as `200` with the original body); reusing the
 same key with different request content returns `409`. Concurrent identical
 requests create exactly one reservation. Quota checks and writes run in a
-single row-locked transaction so quota can never be oversubscribed.
+single row-locked transaction so quota can never be oversubscribed — at
+neither the pool nor the team level, and allocation changes, reservations,
+confirmations, releases and expiry cleanup all serialize on the same pool row
+lock.
 
 Malformed or invalid requests return `400` and write nothing. Storage failures
 return a generic `503` (`{"error":"service temporarily unavailable"}`) and
