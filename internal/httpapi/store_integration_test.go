@@ -43,7 +43,7 @@ func newEnv(t *testing.T) *env {
 	}
 	// Recreate the schema so test runs track the current table definitions.
 	e := &env{t: t, pool: pool, handler: New(NewStore(pool))}
-	e.exec(`DROP TABLE IF EXISTS idempotency_records, reservations, quota_pools CASCADE`)
+	e.exec(`DROP TABLE IF EXISTS idempotency_records, reservations, team_allocations, quota_pools CASCADE`)
 	if err := EnsureSchema(ctx, pool); err != nil {
 		pool.Close()
 		t.Fatalf("ensure schema: %v", err)
@@ -399,6 +399,318 @@ func TestIntegrationConfirmReleaseConcurrentAtMostOne(t *testing.T) {
 	}
 }
 
+func (e *env) setAllocationRaw(tenant, pool, team, key, body string) *httptest.ResponseRecorder {
+	return e.do(http.MethodPost, "/v1/tenants/"+tenant+"/quota-pools/"+pool+"/teams/"+team+"/allocation", key, body)
+}
+
+func (e *env) setAllocation(tenant, pool, team, key string, amount, expectedVersion int64) *httptest.ResponseRecorder {
+	body := fmt.Sprintf(`{"amount":%d,"expectedVersion":%d}`, amount, expectedVersion)
+	return e.setAllocationRaw(tenant, pool, team, key, body)
+}
+
+func (e *env) getAllocation(tenant, pool, team string) *httptest.ResponseRecorder {
+	return e.do(http.MethodGet, "/v1/tenants/"+tenant+"/quota-pools/"+pool+"/teams/"+team+"/allocation", "", "")
+}
+
+func TestIntegrationAllocationLifecycle(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("ta", "pa", 10, now.Add(-time.Hour), now.Add(2*time.Hour))
+
+	// Nothing set yet: 404, also cross-tenant.
+	if rec := e.getAllocation("ta", "pa", "team1"); rec.Code != http.StatusNotFound {
+		t.Fatalf("unset allocation status=%d", rec.Code)
+	}
+	if rec := e.getAllocation("other", "pa", "team1"); rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-tenant status=%d", rec.Code)
+	}
+	// Allocation on a missing pool is a conflict.
+	if rec := e.setAllocation("ta", "ghost", "team1", "ka0", 5, 0); rec.Code != http.StatusConflict {
+		t.Fatalf("missing pool status=%d", rec.Code)
+	}
+
+	// Initial allocation: version 0 -> 1.
+	rec := e.setAllocation("ta", "pa", "team1", "ka1", 6, 0)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{`"teamId":"team1"`, `"allocated":6`, `"used":0`, `"available":6`, `"version":1`} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("response missing %s: %s", want, rec.Body.String())
+		}
+	}
+	get := e.getAllocation("ta", "pa", "team1")
+	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"allocated":6`) || !strings.Contains(get.Body.String(), `"version":1`) {
+		t.Fatalf("get status=%d body=%s", get.Code, get.Body.String())
+	}
+
+	// Stale version is a conflict and changes nothing.
+	if rec := e.setAllocation("ta", "pa", "team1", "ka2", 2, 0); rec.Code != http.StatusConflict {
+		t.Fatalf("stale version status=%d", rec.Code)
+	}
+	if get := e.getAllocation("ta", "pa", "team1"); !strings.Contains(get.Body.String(), `"allocated":6`) {
+		t.Fatalf("state changed after conflict: %s", get.Body.String())
+	}
+
+	// Matching version updates and increments.
+	rec = e.setAllocation("ta", "pa", "team1", "ka3", 4, 1)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"allocated":4`) || !strings.Contains(rec.Body.String(), `"version":2`) {
+		t.Fatalf("update status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Idempotent replay returns the first result; different content conflicts.
+	replay := e.setAllocation("ta", "pa", "team1", "ka3", 4, 1)
+	if replay.Code != http.StatusOK || replay.Body.String() != rec.Body.String() {
+		t.Fatalf("replay status=%d body=%s original=%s", replay.Code, replay.Body.String(), rec.Body.String())
+	}
+	if rec := e.setAllocation("ta", "pa", "team1", "ka3", 5, 1); rec.Code != http.StatusConflict {
+		t.Fatalf("key reuse with different content status=%d", rec.Code)
+	}
+}
+
+func TestIntegrationAllocationReplayOfConflictReturns200(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("tr", "pr", 10, now.Add(-time.Hour), now.Add(2*time.Hour))
+
+	// Version mismatch is decided before business validation and stored.
+	first := e.setAllocation("tr", "pr", "team1", "kf", 5, 3)
+	if first.Code != http.StatusConflict {
+		t.Fatalf("first status=%d", first.Code)
+	}
+	// Move the version forward with another key.
+	if rec := e.setAllocation("tr", "pr", "team1", "kok", 5, 0); rec.Code != http.StatusOK {
+		t.Fatalf("setup status=%d", rec.Code)
+	}
+	// Replaying the failed request returns 200 with the original outcome; the
+	// stored result is not re-evaluated against the new version.
+	replay := e.setAllocation("tr", "pr", "team1", "kf", 5, 3)
+	if replay.Code != http.StatusOK || replay.Body.String() != first.Body.String() {
+		t.Fatalf("replay status=%d body=%s original=%s", replay.Code, replay.Body.String(), first.Body.String())
+	}
+	if get := e.getAllocation("tr", "pr", "team1"); !strings.Contains(get.Body.String(), `"version":1`) {
+		t.Fatalf("replay must not change state: %s", get.Body.String())
+	}
+}
+
+func TestIntegrationAllocationSumLimitedByPool(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("tl", "pl", 10, now.Add(-time.Hour), now.Add(2*time.Hour))
+
+	if rec := e.setAllocation("tl", "pl", "teamA", "k1", 6, 0); rec.Code != http.StatusOK {
+		t.Fatalf("teamA status=%d", rec.Code)
+	}
+	if rec := e.setAllocation("tl", "pl", "teamB", "k2", 5, 0); rec.Code != http.StatusConflict {
+		t.Fatalf("teamB over-sum status=%d", rec.Code)
+	}
+	if rec := e.setAllocation("tl", "pl", "teamB", "k3", 4, 0); rec.Code != http.StatusOK {
+		t.Fatalf("teamB status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// Raising teamA past the remaining headroom conflicts; lowering is fine.
+	if rec := e.setAllocation("tl", "pl", "teamA", "k4", 7, 1); rec.Code != http.StatusConflict {
+		t.Fatalf("teamA raise status=%d", rec.Code)
+	}
+	if rec := e.setAllocation("tl", "pl", "teamA", "k5", 6, 1); rec.Code != http.StatusOK {
+		t.Fatalf("teamA same-sum status=%d", rec.Code)
+	}
+}
+
+func TestIntegrationAllocationNotBelowTeamUsage(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("tu", "pu", 10, now.Add(-time.Hour), now.Add(2*time.Hour))
+	if rec := e.setAllocation("tu", "pu", "team1", "ka", 8, 0); rec.Code != http.StatusOK {
+		t.Fatalf("alloc status=%d", rec.Code)
+	}
+
+	body := fmt.Sprintf(`{"reservationId":"r1","teamId":"team1","amount":5,"expiresAt":%q}`,
+		now.Add(time.Hour).Format(time.RFC3339Nano))
+	if rec := e.createReservationRaw("tu", "pu", "kr1", body); rec.Code != http.StatusCreated {
+		t.Fatalf("reserve status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Lowering below the team's active usage conflicts and changes nothing.
+	if rec := e.setAllocation("tu", "pu", "team1", "kb", 4, 1); rec.Code != http.StatusConflict {
+		t.Fatalf("lower below usage status=%d", rec.Code)
+	}
+	get := e.getAllocation("tu", "pu", "team1")
+	for _, want := range []string{`"allocated":8`, `"used":5`, `"available":3`, `"version":1`} {
+		if !strings.Contains(get.Body.String(), want) {
+			t.Fatalf("get missing %s: %s", want, get.Body.String())
+		}
+	}
+
+	// Lowering exactly to the usage is allowed and leaves no headroom.
+	if rec := e.setAllocation("tu", "pu", "team1", "kc", 5, 1); rec.Code != http.StatusOK {
+		t.Fatalf("lower to usage status=%d", rec.Code)
+	}
+	body2 := fmt.Sprintf(`{"reservationId":"r2","teamId":"team1","amount":1,"expiresAt":%q}`,
+		now.Add(time.Hour).Format(time.RFC3339Nano))
+	if rec := e.createReservationRaw("tu", "pu", "kr2", body2); rec.Code != http.StatusConflict {
+		t.Fatalf("team headroom status=%d", rec.Code)
+	}
+
+	// Releasing the reservation restores the team balance.
+	if rec := e.do(http.MethodPost, "/v1/tenants/tu/quota-pools/pu/reservations/r1/release", "krel", ""); rec.Code != http.StatusOK {
+		t.Fatalf("release status=%d", rec.Code)
+	}
+	if get := e.getAllocation("tu", "pu", "team1"); !strings.Contains(get.Body.String(), `"available":5`) {
+		t.Fatalf("balance not restored: %s", get.Body.String())
+	}
+}
+
+func TestIntegrationTeamReservation(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("tt", "pt", 10, now.Add(-time.Hour), now.Add(2*time.Hour))
+	expiry := now.Add(time.Hour).Format(time.RFC3339Nano)
+
+	// Unknown team is a conflict.
+	body := fmt.Sprintf(`{"reservationId":"r0","teamId":"ghost","amount":1,"expiresAt":%q}`, expiry)
+	if rec := e.createReservationRaw("tt", "pt", "k0", body); rec.Code != http.StatusConflict {
+		t.Fatalf("unknown team status=%d", rec.Code)
+	}
+
+	if rec := e.setAllocation("tt", "pt", "team1", "ka", 4, 0); rec.Code != http.StatusOK {
+		t.Fatalf("alloc status=%d", rec.Code)
+	}
+
+	// Team reservation carries teamId in the create response and the record.
+	body = fmt.Sprintf(`{"reservationId":"r1","teamId":"team1","amount":4,"expiresAt":%q}`, expiry)
+	rec := e.createReservationRaw("tt", "pt", "k1", body)
+	if rec.Code != http.StatusCreated || !strings.Contains(rec.Body.String(), `"teamId":"team1"`) {
+		t.Fatalf("create status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	get := e.do(http.MethodGet, "/v1/tenants/tt/quota-pools/pt/reservations/r1", "", "")
+	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"teamId":"team1"`) {
+		t.Fatalf("get status=%d body=%s", get.Code, get.Body.String())
+	}
+
+	// Team balance exhausted even though the pool has headroom.
+	body = fmt.Sprintf(`{"reservationId":"r2","teamId":"team1","amount":1,"expiresAt":%q}`, expiry)
+	if rec := e.createReservationRaw("tt", "pt", "k2", body); rec.Code != http.StatusConflict {
+		t.Fatalf("team exhaustion status=%d", rec.Code)
+	}
+
+	// Unteammed reservations still draw on the pool and omit teamId.
+	body = fmt.Sprintf(`{"reservationId":"r3","amount":6,"expiresAt":%q}`, expiry)
+	rec = e.createReservationRaw("tt", "pt", "k3", body)
+	if rec.Code != http.StatusCreated || strings.Contains(rec.Body.String(), "teamId") {
+		t.Fatalf("unteammed create status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// Pool is now full (4 team + 6 plain); one more of any kind conflicts.
+	body = fmt.Sprintf(`{"reservationId":"r4","amount":1,"expiresAt":%q}`, expiry)
+	if rec := e.createReservationRaw("tt", "pt", "k4", body); rec.Code != http.StatusConflict {
+		t.Fatalf("pool exhaustion status=%d", rec.Code)
+	}
+
+	// Confirming keeps the team balance occupied.
+	if rec := e.do(http.MethodPost, "/v1/tenants/tt/quota-pools/pt/reservations/r1/confirm", "kc1", ""); rec.Code != http.StatusOK {
+		t.Fatalf("confirm status=%d", rec.Code)
+	}
+	if rec := e.setAllocation("tt", "pt", "team1", "kb", 3, 1); rec.Code != http.StatusConflict {
+		t.Fatalf("lower below confirmed usage status=%d", rec.Code)
+	}
+	if get := e.getAllocation("tt", "pt", "team1"); !strings.Contains(get.Body.String(), `"used":4`) {
+		t.Fatalf("confirmed usage: %s", get.Body.String())
+	}
+}
+
+func TestIntegrationTeamReservationExpiryRestoresBalance(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("tx", "px", 10, now.Add(-time.Hour), now.Add(2*time.Hour))
+	if rec := e.setAllocation("tx", "px", "team1", "ka", 5, 0); rec.Code != http.StatusOK {
+		t.Fatalf("alloc status=%d", rec.Code)
+	}
+
+	deadline := time.Now().Add(1100 * time.Millisecond)
+	body := fmt.Sprintf(`{"reservationId":"r1","teamId":"team1","amount":5,"expiresAt":%q}`,
+		deadline.Format(time.RFC3339Nano))
+	if rec := e.createReservationRaw("tx", "px", "k1", body); rec.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if get := e.getAllocation("tx", "px", "team1"); !strings.Contains(get.Body.String(), `"available":0`) {
+		t.Fatalf("pending must occupy team balance: %s", get.Body.String())
+	}
+
+	time.Sleep(1300 * time.Millisecond)
+
+	// Expiry releases the team balance; lowering to zero then succeeds.
+	if get := e.getAllocation("tx", "px", "team1"); !strings.Contains(get.Body.String(), `"available":5`) {
+		t.Fatalf("expiry must restore team balance: %s", get.Body.String())
+	}
+	if rec := e.setAllocation("tx", "px", "team1", "kb", 0, 1); rec.Code != http.StatusOK {
+		t.Fatalf("lower after expiry status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestIntegrationConcurrentTeamLayersNeverOversubscribe(t *testing.T) {
+	e := newEnv(t)
+	now := time.Now().UTC()
+	e.createPool("tz", "pz", 100, now.Add(-time.Hour), now.Add(2*time.Hour))
+	if rec := e.setAllocation("tz", "pz", "team1", "ka", 50, 0); rec.Code != http.StatusOK {
+		t.Fatalf("alloc status=%d", rec.Code)
+	}
+
+	// Twenty concurrent team reservations of 10 against a 50 allocation.
+	var wg sync.WaitGroup
+	statuses := make(chan int, 20)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body := fmt.Sprintf(`{"reservationId":"r%02d","teamId":"team1","amount":10,"expiresAt":%q}`,
+				i, now.Add(time.Hour).Format(time.RFC3339Nano))
+			statuses <- e.createReservationRaw("tz", "pz", fmt.Sprintf("key-%02d", i), body).Code
+		}(i)
+	}
+	wg.Wait()
+	close(statuses)
+
+	created := 0
+	for s := range statuses {
+		if s == http.StatusCreated {
+			created++
+		} else if s != http.StatusConflict {
+			t.Fatalf("unexpected status %d", s)
+		}
+	}
+	if created != 5 {
+		t.Fatalf("created=%d, team allocation must cap at 5", created)
+	}
+	if get := e.getAllocation("tz", "pz", "team1"); !strings.Contains(get.Body.String(), `"used":50`) {
+		t.Fatalf("team usage must never exceed the allocation: %s", get.Body.String())
+	}
+
+	// Concurrent allocations that together exceed the pool limit: one wins.
+	// team1 already holds 50 of the 100 limit, so only one 50 fits.
+	results := make(chan int, 2)
+	for i, team := range []string{"teamA", "teamB"} {
+		wg.Add(1)
+		go func(i int, team string) {
+			defer wg.Done()
+			results <- e.setAllocation("tz", "pz", team, fmt.Sprintf("kc-%d", i), 50, 0).Code
+		}(i, team)
+	}
+	wg.Wait()
+	close(results)
+	ok, conflict := 0, 0
+	for s := range results {
+		if s == http.StatusOK {
+			ok++
+		} else if s == http.StatusConflict {
+			conflict++
+		} else {
+			t.Fatalf("unexpected status %d", s)
+		}
+	}
+	if ok != 1 || conflict != 1 {
+		t.Fatalf("allocations must serialize around the pool limit, ok=%d conflict=%d", ok, conflict)
+	}
+}
+
 func (e *env) queryIntRowStatus(tenant, pool, reservation string) int {
 	var status string
 	if err := e.pool.QueryRow(context.Background(),
@@ -530,6 +842,9 @@ func TestIntegrationDataSurvivesPoolRestart(t *testing.T) {
 	now := time.Now().UTC()
 	e.createPool("ts", "ps", 10, now.Add(-time.Hour), now.Add(2*time.Hour))
 	e.createReservation("ts", "ps", "r1", "k1", 3, now.Add(time.Hour))
+	if rec := e.setAllocation("ts", "ps", "team1", "ka1", 4, 0); rec.Code != http.StatusOK {
+		t.Fatalf("alloc status=%d", rec.Code)
+	}
 
 	// Reopen the connection pool as a freshly started process would.
 	url := testDatabaseURL()
@@ -551,5 +866,13 @@ func TestIntegrationDataSurvivesPoolRestart(t *testing.T) {
 	rec = e.createReservationRaw("ts", "ps", "k1", body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("idempotency replay after restart status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// Allocations and their idempotency records survive as well.
+	rec = e.getAllocation("ts", "ps", "team1")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"allocated":4`) {
+		t.Fatalf("allocation did not survive restart: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := e.setAllocation("ts", "ps", "team1", "ka1", 4, 0); rec.Code != http.StatusOK {
+		t.Fatalf("allocation replay after restart status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }

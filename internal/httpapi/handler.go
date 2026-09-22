@@ -23,8 +23,14 @@ type poolInput struct {
 
 type reservationInput struct {
 	reservationID string
+	teamID        string // empty means the reservation is not attributed to a team
 	amount        int64
 	expiresAt     time.Time
+}
+
+type allocationInput struct {
+	amount          int64
+	expectedVersion int64
 }
 
 type poolResponse struct {
@@ -40,11 +46,20 @@ type reservationResponse struct {
 	TenantID      string    `json:"tenantId"`
 	PoolID        string    `json:"poolId"`
 	ReservationID string    `json:"reservationId"`
+	TeamID        *string   `json:"teamId,omitempty"`
 	Amount        int64     `json:"amount"`
 	Status        string    `json:"status"`
 	ExpiresAt     time.Time `json:"expiresAt"`
 	CreatedAt     time.Time `json:"createdAt"`
 	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+type allocationResponse struct {
+	TeamID    string `json:"teamId"`
+	Allocated int64  `json:"allocated"`
+	Used      int64  `json:"used"`
+	Available int64  `json:"available"`
+	Version   int64  `json:"version"`
 }
 
 type errorResponse struct {
@@ -65,6 +80,8 @@ type backend interface {
 	createReservation(ctx context.Context, tenantID, poolID, idempotencyKey, requestHash string, in reservationInput) (operationResult, error)
 	decideReservation(ctx context.Context, tenantID, poolID, reservationID, idempotencyKey, requestHash, decision string) (operationResult, error)
 	getReservation(ctx context.Context, tenantID, poolID, reservationID string) (reservationResponse, error)
+	setAllocation(ctx context.Context, tenantID, poolID, teamID, idempotencyKey, requestHash string, in allocationInput) (operationResult, error)
+	getAllocation(ctx context.Context, tenantID, poolID, teamID string) (allocationResponse, error)
 }
 
 // Routing ---------------------------------------------------------------
@@ -93,6 +110,8 @@ func New(b backend) http.Handler {
 	// Alternate "R/{reservationId}:confirm|release" action syntax.
 	mux.HandleFunc("POST /v1/tenants/{tenantId}/quota-pools/{poolId}/reservations/{idAction}", api.reservationAction)
 	mux.HandleFunc("GET /v1/tenants/{tenantId}/quota-pools/{poolId}/reservations/{reservationId}", api.getReservation)
+	mux.HandleFunc("POST /v1/tenants/{tenantId}/quota-pools/{poolId}/teams/{teamId}/allocation", api.postAllocation)
+	mux.HandleFunc("GET /v1/tenants/{tenantId}/quota-pools/{poolId}/teams/{teamId}/allocation", api.getAllocation)
 
 	return mux
 }
@@ -111,8 +130,14 @@ type putPoolRequest struct {
 
 type postReservationRequest struct {
 	ReservationID *string `json:"reservationId"`
+	TeamID        *string `json:"teamId"`
 	Amount        *int64  `json:"amount"`
 	ExpiresAt     *string `json:"expiresAt"`
+}
+
+type postAllocationRequest struct {
+	Amount          *int64 `json:"amount"`
+	ExpectedVersion *int64 `json:"expectedVersion"`
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -226,17 +251,27 @@ func (a *api) postReservation(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "expiresAt must be an RFC3339 timestamp")
 		return
 	}
+	teamID := ""
+	if req.TeamID != nil {
+		teamID = strings.TrimSpace(*req.TeamID)
+		if teamID == "" {
+			badRequest(w, "teamId must not be blank")
+			return
+		}
+	}
 
 	in := reservationInput{
 		reservationID: strings.TrimSpace(*req.ReservationID),
+		teamID:        teamID,
 		amount:        *req.Amount,
 		expiresAt:     expiresAt,
 	}
 	canonical, _ := json.Marshal(struct {
 		ReservationID string `json:"reservationId"`
+		TeamID        string `json:"teamId,omitempty"`
 		Amount        int64  `json:"amount"`
 		ExpiresAt     string `json:"expiresAt"`
-	}{in.reservationID, in.amount, in.expiresAt.Format(time.RFC3339Nano)})
+	}{in.reservationID, in.teamID, in.amount, in.expiresAt.Format(time.RFC3339Nano)})
 
 	result, err := a.backend.createReservation(r.Context(), tenantID, poolID, key, requestHash(r, canonical), in)
 	if err != nil {
@@ -304,6 +339,59 @@ func (a *api) getReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, reservation)
+}
+
+func (a *api) postAllocation(w http.ResponseWriter, r *http.Request) {
+	key, ok := a.idempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	tenantID := r.PathValue("tenantId")
+	poolID := r.PathValue("poolId")
+	teamID := r.PathValue("teamId")
+
+	var req postAllocationRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Amount == nil || *req.Amount < 0 {
+		badRequest(w, "amount must be a non-negative integer")
+		return
+	}
+	if req.ExpectedVersion == nil || *req.ExpectedVersion < 0 {
+		badRequest(w, "expectedVersion must be a non-negative integer")
+		return
+	}
+
+	in := allocationInput{amount: *req.Amount, expectedVersion: *req.ExpectedVersion}
+	canonical, _ := json.Marshal(struct {
+		Amount          int64 `json:"amount"`
+		ExpectedVersion int64 `json:"expectedVersion"`
+	}{in.amount, in.expectedVersion})
+
+	result, err := a.backend.setAllocation(r.Context(), tenantID, poolID, teamID, key, requestHash(r, canonical), in)
+	if err != nil {
+		storageFailed(w, err)
+		return
+	}
+	writeJSON(w, result.status, result.body)
+}
+
+func (a *api) getAllocation(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("tenantId")
+	poolID := r.PathValue("poolId")
+	teamID := r.PathValue("teamId")
+
+	allocation, err := a.backend.getAllocation(r.Context(), tenantID, poolID, teamID)
+	if err != nil {
+		if errors.Is(err, errNotFound) {
+			fail(w, http.StatusNotFound, errorResponse{Error: "team allocation not found"})
+			return
+		}
+		storageFailed(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, allocation)
 }
 
 // Response helpers ------------------------------------------------------

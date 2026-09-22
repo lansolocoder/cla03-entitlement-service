@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     tenant_id      text        NOT NULL,
     pool_id        text        NOT NULL,
     reservation_id text        NOT NULL,
+    team_id        text,
     amount         bigint      NOT NULL CHECK (amount > 0),
     status         text        NOT NULL CHECK (status IN ('pending', 'confirmed', 'released', 'expired')),
     expires_at     timestamptz NOT NULL,
@@ -43,6 +44,18 @@ CREATE TABLE IF NOT EXISTS reservations (
 CREATE INDEX IF NOT EXISTS reservations_active_idx
     ON reservations (tenant_id, pool_id, expires_at)
     WHERE status IN ('pending', 'confirmed');
+
+CREATE TABLE IF NOT EXISTS team_allocations (
+    tenant_id  text        NOT NULL,
+    pool_id    text        NOT NULL,
+    team_id    text        NOT NULL,
+    allocated  bigint      NOT NULL CHECK (allocated >= 0),
+    version    bigint      NOT NULL CHECK (version >= 0),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, pool_id, team_id),
+    FOREIGN KEY (tenant_id, pool_id) REFERENCES quota_pools (tenant_id, pool_id)
+);
 
 CREATE TABLE IF NOT EXISTS idempotency_records (
     id              bigserial    PRIMARY KEY,
@@ -65,7 +78,10 @@ func EnsureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
 		return err
 	}
-	return nil
+	// Upgrade pre-team databases: CREATE TABLE IF NOT EXISTS does not add
+	// columns to a table that already exists.
+	_, err := pool.Exec(ctx, `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS team_id text`)
+	return err
 }
 
 type pgStore struct {
@@ -212,6 +228,22 @@ func expirePending(ctx context.Context, tx pgx.Tx, tenantID, poolID string) erro
 	return err
 }
 
+// teamUsage is the quota currently held by a team: all confirmed reservations
+// plus unexpired pending ones. Must run while the pool row lock is held.
+func teamUsage(ctx context.Context, tx pgx.Tx, tenantID, poolID, teamID string) (int64, error) {
+	var used int64
+	err := tx.QueryRow(ctx, `
+		SELECT COALESCE(SUM(amount), 0)
+		FROM reservations
+		WHERE tenant_id = $1 AND pool_id = $2 AND team_id = $3 AND (
+		    status = 'confirmed'
+		    OR (status = 'pending' AND expires_at > now())
+		)`,
+		tenantID, poolID, teamID,
+	).Scan(&used)
+	return used, err
+}
+
 func (s *pgStore) createReservation(ctx context.Context, tenantID, poolID, key, requestHash string, in reservationInput) (operationResult, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -285,19 +317,49 @@ func (s *pgStore) createReservation(ctx context.Context, tenantID, poolID, key, 
 		return fail("insufficient quota available")
 	}
 
+	// Team-attributed reservations additionally need an existing team
+	// allocation with enough team-level balance. The pool row lock held
+	// since the top of the transaction serializes this against concurrent
+	// allocation changes, reservations, decisions and expiry, so neither
+	// layer can be oversubscribed.
+	var teamID *string
+	if in.teamID != "" {
+		var allocated int64
+		err = tx.QueryRow(ctx, `
+			SELECT allocated FROM team_allocations
+			WHERE tenant_id = $1 AND pool_id = $2 AND team_id = $3`,
+			tenantID, poolID, in.teamID,
+		).Scan(&allocated)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fail("team allocation not found")
+		}
+		if err != nil {
+			return operationResult{}, err
+		}
+		used, err := teamUsage(ctx, tx, tenantID, poolID, in.teamID)
+		if err != nil {
+			return operationResult{}, err
+		}
+		if allocated-used < in.amount {
+			return fail("insufficient team quota available")
+		}
+		teamID = &in.teamID
+	}
+
 	resp := reservationResponse{
 		TenantID:      tenantID,
 		PoolID:        poolID,
 		ReservationID: in.reservationID,
+		TeamID:        teamID,
 		Amount:        in.amount,
 		Status:        "pending",
 		ExpiresAt:     in.expiresAt,
 	}
 	err = tx.QueryRow(ctx, `
-		INSERT INTO reservations (tenant_id, pool_id, reservation_id, amount, status, expires_at)
-		VALUES ($1, $2, $3, $4, 'pending', $5)
+		INSERT INTO reservations (tenant_id, pool_id, reservation_id, team_id, amount, status, expires_at)
+		VALUES ($1, $2, $3, $4, $5, 'pending', $6)
 		RETURNING created_at, updated_at`,
-		tenantID, poolID, in.reservationID, in.amount, in.expiresAt,
+		tenantID, poolID, in.reservationID, teamID, in.amount, in.expiresAt,
 	).Scan(&resp.CreatedAt, &resp.UpdatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -362,12 +424,12 @@ func (s *pgStore) decideReservation(ctx context.Context, tenantID, poolID, reser
 
 	var resp reservationResponse
 	err = tx.QueryRow(ctx, `
-		SELECT tenant_id, pool_id, reservation_id, amount, status, expires_at, created_at, updated_at
+		SELECT tenant_id, pool_id, reservation_id, team_id, amount, status, expires_at, created_at, updated_at
 		FROM reservations
 		WHERE tenant_id = $1 AND pool_id = $2 AND reservation_id = $3
 		FOR UPDATE`,
 		tenantID, poolID, reservationID,
-	).Scan(&resp.TenantID, &resp.PoolID, &resp.ReservationID, &resp.Amount, &resp.Status, &resp.ExpiresAt, &resp.CreatedAt, &resp.UpdatedAt)
+	).Scan(&resp.TenantID, &resp.PoolID, &resp.ReservationID, &resp.TeamID, &resp.Amount, &resp.Status, &resp.ExpiresAt, &resp.CreatedAt, &resp.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fail("reservation is not pending")
 	}
@@ -420,11 +482,11 @@ func (s *pgStore) getReservation(ctx context.Context, tenantID, poolID, reservat
 
 	var resp reservationResponse
 	err = tx.QueryRow(ctx, `
-		SELECT tenant_id, pool_id, reservation_id, amount, status, expires_at, created_at, updated_at
+		SELECT tenant_id, pool_id, reservation_id, team_id, amount, status, expires_at, created_at, updated_at
 		FROM reservations
 		WHERE tenant_id = $1 AND pool_id = $2 AND reservation_id = $3`,
 		tenantID, poolID, reservationID,
-	).Scan(&resp.TenantID, &resp.PoolID, &resp.ReservationID, &resp.Amount, &resp.Status, &resp.ExpiresAt, &resp.CreatedAt, &resp.UpdatedAt)
+	).Scan(&resp.TenantID, &resp.PoolID, &resp.ReservationID, &resp.TeamID, &resp.Amount, &resp.Status, &resp.ExpiresAt, &resp.CreatedAt, &resp.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return reservationResponse{}, errNotFound
 	}
@@ -435,5 +497,166 @@ func (s *pgStore) getReservation(ctx context.Context, tenantID, poolID, reservat
 		return reservationResponse{}, err
 	}
 	resp.normalize()
+	return resp, nil
+}
+
+func (s *pgStore) setAllocation(ctx context.Context, tenantID, poolID, teamID, key, requestHash string, in allocationInput) (operationResult, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return operationResult{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	operation := "set_allocation:" + poolID + ":" + teamID
+	outcome, replay, err := claimIdempotency(ctx, tx, tenantID, operation, key, requestHash)
+	if err != nil {
+		return operationResult{}, err
+	}
+	if outcome != idempotencyClaimed {
+		if err := tx.Commit(ctx); err != nil {
+			return operationResult{}, err
+		}
+		return replay, nil
+	}
+	fail := func(message string) (operationResult, error) {
+		return conflictResult(ctx, tx, tenantID, key, message)
+	}
+
+	// Lock the pool row so allocations, reservations, decisions and expiry
+	// cleanup on the same pool serialize; the sum and usage checks below then
+	// observe a stable state and neither layer can be oversubscribed.
+	var poolLimit int64
+	err = tx.QueryRow(ctx, `
+		SELECT lim FROM quota_pools
+		WHERE tenant_id = $1 AND pool_id = $2
+		FOR UPDATE`,
+		tenantID, poolID,
+	).Scan(&poolLimit)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fail("quota pool not found")
+	}
+	if err != nil {
+		return operationResult{}, err
+	}
+
+	// Lazy expiry first: freed pending quota must not block a lowering, and
+	// the reported usage must reflect it.
+	if err := expirePending(ctx, tx, tenantID, poolID); err != nil {
+		return operationResult{}, err
+	}
+
+	// A team starts with allocated 0 and version 0 before its first
+	// allocation is set.
+	var allocated, version int64
+	err = tx.QueryRow(ctx, `
+		SELECT allocated, version FROM team_allocations
+		WHERE tenant_id = $1 AND pool_id = $2 AND team_id = $3
+		FOR UPDATE`,
+		tenantID, poolID, teamID,
+	).Scan(&allocated, &version)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return operationResult{}, err
+	}
+	if in.expectedVersion != version {
+		return fail("version mismatch")
+	}
+
+	used, err := teamUsage(ctx, tx, tenantID, poolID, teamID)
+	if err != nil {
+		return operationResult{}, err
+	}
+	if in.amount < used {
+		return fail("allocation cannot be lower than the team's active reservations")
+	}
+
+	var othersTotal int64
+	err = tx.QueryRow(ctx, `
+		SELECT COALESCE(SUM(allocated), 0) FROM team_allocations
+		WHERE tenant_id = $1 AND pool_id = $2 AND team_id <> $3`,
+		tenantID, poolID, teamID,
+	).Scan(&othersTotal)
+	if err != nil {
+		return operationResult{}, err
+	}
+	if othersTotal+in.amount > poolLimit {
+		return fail("total allocations would exceed the pool limit")
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO team_allocations (tenant_id, pool_id, team_id, allocated, version)
+		VALUES ($1, $2, $3, $4, 1)
+		ON CONFLICT (tenant_id, pool_id, team_id)
+		DO UPDATE SET allocated = $4, version = team_allocations.version + 1, updated_at = now()`,
+		tenantID, poolID, teamID, in.amount,
+	)
+	if err != nil {
+		return operationResult{}, err
+	}
+
+	resp := allocationResponse{
+		TeamID:    teamID,
+		Allocated: in.amount,
+		Used:      used,
+		Available: in.amount - used,
+		Version:   version + 1,
+	}
+	result := operationResult{status: http.StatusOK, body: mustJSON(resp)}
+	if err := completeIdempotency(ctx, tx, tenantID, key, result); err != nil {
+		return operationResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return operationResult{}, err
+	}
+	return result, nil
+}
+
+func (s *pgStore) getAllocation(ctx context.Context, tenantID, poolID, teamID string) (allocationResponse, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return allocationResponse{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Lock the pool so the usage figure is computed against a stable
+	// reservation set after lazy expiry.
+	var poolLimit int64
+	err = tx.QueryRow(ctx, `
+		SELECT lim FROM quota_pools
+		WHERE tenant_id = $1 AND pool_id = $2
+		FOR UPDATE`,
+		tenantID, poolID,
+	).Scan(&poolLimit)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return allocationResponse{}, errNotFound
+	}
+	if err != nil {
+		return allocationResponse{}, err
+	}
+	if err := expirePending(ctx, tx, tenantID, poolID); err != nil {
+		return allocationResponse{}, err
+	}
+
+	var resp allocationResponse
+	err = tx.QueryRow(ctx, `
+		SELECT allocated, version FROM team_allocations
+		WHERE tenant_id = $1 AND pool_id = $2 AND team_id = $3`,
+		tenantID, poolID, teamID,
+	).Scan(&resp.Allocated, &resp.Version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return allocationResponse{}, errNotFound
+	}
+	if err != nil {
+		return allocationResponse{}, err
+	}
+	used, err := teamUsage(ctx, tx, tenantID, poolID, teamID)
+	if err != nil {
+		return allocationResponse{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return allocationResponse{}, err
+	}
+	resp.TeamID = teamID
+	resp.Used = used
+	resp.Available = resp.Allocated - used
 	return resp, nil
 }
