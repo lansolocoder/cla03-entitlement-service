@@ -18,8 +18,8 @@ func TestHealthAndReadiness(t *testing.T) {
 		{"liveness", "GET", "/healthz", "ok", errors.New("database offline"), 200, 0},
 		{"ready", "GET", "/readyz", "ready", nil, 200, 1},
 		{"unavailable", "GET", "/readyz", "unavailable", errors.New("private connection details"), 503, 1},
-		{"unknown path", "GET", "/entitlements", "404", nil, 404, 0},
-		{"wrong method", "POST", "/readyz", "Method Not Allowed", nil, 405, 0},
+		{"unknown path", "GET", "/entitlements", "not_found", nil, 404, 0},
+		{"wrong method", "POST", "/readyz", "method_not_allowed", nil, 405, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
@@ -29,7 +29,7 @@ func TestHealthAndReadiness(t *testing.T) {
 					t.Error("readiness database check must have a deadline")
 				}
 				return tc.dbError
-			})
+			}, nil)
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, httptest.NewRequest(tc.method, tc.path, nil))
 			if response.Code != tc.status || !strings.Contains(response.Body.String(), tc.body) || calls != tc.calls {
