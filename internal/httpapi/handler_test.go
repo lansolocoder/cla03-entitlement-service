@@ -5,7 +5,11 @@ import (
 	"errors"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/lansolocoder/cla03-entitlement-service/internal/grants"
 )
 
 func TestHealthAndReadiness(t *testing.T) {
@@ -23,7 +27,7 @@ func TestHealthAndReadiness(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
-			handler := New(func(ctx context.Context) error {
+			handler := New(newFakeStore(), func(ctx context.Context) error {
 				calls++
 				if _, ok := ctx.Deadline(); !ok {
 					t.Error("readiness database check must have a deadline")
@@ -40,4 +44,78 @@ func TestHealthAndReadiness(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fakeStore is an in-memory grants.Store for handler tests.
+type fakeStore struct {
+	mu          sync.Mutex
+	grants      map[string]grants.Grant // key: tenant + "/" + grantID
+	failCreate  bool
+	failList    bool
+	failCancel  bool
+	cancelCalls int
+}
+
+func newFakeStore() *fakeStore {
+	return &fakeStore{grants: map[string]grants.Grant{}}
+}
+
+func key(tenant, grantID string) string { return tenant + "/" + grantID }
+
+func (f *fakeStore) Create(_ context.Context, g grants.Grant) (grants.Grant, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failCreate {
+		return grants.Grant{}, false, errors.New("storage unavailable")
+	}
+	k := key(g.Tenant, g.GrantID)
+	if existing, ok := f.grants[k]; ok {
+		if existing.Feature == g.Feature && existing.Amount == g.Amount &&
+			existing.EffectiveAt.Equal(g.EffectiveAt) && existing.ExpiresAt.Equal(g.ExpiresAt) {
+			return existing, true, nil
+		}
+		return grants.Grant{}, false, grants.ErrConflict
+	}
+	g.State = grants.StateActive
+	f.grants[k] = g
+	return g, false, nil
+}
+
+func (f *fakeStore) ListActiveAt(_ context.Context, tenant string, at time.Time) ([]grants.Grant, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failList {
+		return nil, errors.New("storage unavailable")
+	}
+	var out []grants.Grant
+	for _, g := range f.grants {
+		if g.Tenant != tenant || g.State != grants.StateActive {
+			continue
+		}
+		if (g.EffectiveAt.Equal(at) || g.EffectiveAt.Before(at)) && at.Before(g.ExpiresAt) {
+			out = append(out, g)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) Cancel(_ context.Context, tenant, grantID string, cancelledAt time.Time) (grants.Grant, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelCalls++
+	if f.failCancel {
+		return grants.Grant{}, errors.New("storage unavailable")
+	}
+	k := key(tenant, grantID)
+	g, ok := f.grants[k]
+	if !ok {
+		return grants.Grant{}, grants.ErrNotFound
+	}
+	if g.State != grants.StateCancelled {
+		g.State = grants.StateCancelled
+		c := cancelledAt
+		g.CancelledAt = &c
+		f.grants[k] = g
+	}
+	return g, nil
 }

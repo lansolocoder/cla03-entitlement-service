@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lansolocoder/cla03-entitlement-service/internal/grants"
 	"github.com/lansolocoder/cla03-entitlement-service/internal/httpapi"
 )
 
@@ -26,12 +27,15 @@ func main() {
 		log.Fatal("invalid database configuration")
 	}
 	defer pool.Close()
+	if err := grants.EnsureSchema(ctx, pool); err != nil {
+		log.Fatal("failed to ensure database schema: ", err)
+	}
 	address := os.Getenv("LISTEN_ADDR")
 	if address == "" {
 		address = "127.0.0.1:8080"
 	}
 	server := &http.Server{
-		Addr: address, Handler: httpapi.New(pool.Ping),
+		Addr: address, Handler: httpapi.New(grants.NewPostgresStore(pool), pool.Ping),
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second,
 	}
